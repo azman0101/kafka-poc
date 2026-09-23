@@ -186,7 +186,7 @@ Le script [`install-standalone-user-operator-poc-v4.sh`](./install-standalone-us
 Lors des tests sur cluster local (Docker Desktop / Kubernetes), 6 blocages majeurs ont été diagnostiqués et corrigés dans le script :
 
 ### 5.1. Deadlock du Readiness Probe Kafka (`SSL handshake failed`)
-* **Symptôme :** Le broker loggait toutes les 10s :  
+* **Symptôme :** Le broker loggait toutes les 10s :
   `Failed authentication with /127.0.0.1 (SSL handshake failed)` et le pod restait `0/1 Running`.
 * **Causes :**
   1. Le chart HelmForge code en dur un probe plaintext (`localhost:9092`). Sur un listener configuré en `SSL:required`, la connexion est rejetée.
@@ -198,9 +198,9 @@ Lors des tests sur cluster local (Docker Desktop / Kubernetes), 6 blocages majeu
   - Suppression automatique du pod `kafka-0` après le patch pour déclencher sa recréation immédiate sous la nouvelle révision.
 
 ### 5.2. Format des Clés et Certificats pour Strimzi UO 1.2.0 (`PemAuthIdentity`)
-* **Symptôme :** Crash en boucle de l'opérateur :  
-  `RuntimeException: The Secret ... is missing the field entity-operator.key`  
-  Puis après ajout de la clé :  
+* **Symptôme :** Crash en boucle de l'opérateur :
+  `RuntimeException: The Secret ... is missing the field entity-operator.key`
+  Puis après ajout de la clé :
   `InvalidKeyException: Unable to decode key ... algid parse error, not a sequence`.
 * **Causes :**
   1. Strimzi 1.2.0 a migré son client Admin interne vers `PemAuthIdentity`, qui requiert impérativement les clés `entity-operator.key` et `entity-operator.crt` (et non plus un Keystore PKCS#12).
@@ -210,7 +210,7 @@ Lors des tests sur cluster local (Docker Desktop / Kubernetes), 6 blocages majeu
   - Injection conjointe des formats PEM PKCS#8 (`entity-operator.key`, `entity-operator.crt`) et PKCS#12 dans le Secret `strimzi-user-operator-certs`.
 
 ### 5.3. Sortie propre du Consumer de test
-* **Symptôme :** Log trompeur en fin de test :  
+* **Symptôme :** Log trompeur en fin de test :
   `ERROR Error processing message, terminating consumer process: org.apache.kafka.common.errors.TimeoutException`.
 * **Cause :** `kafka-console-consumer.sh` avec `--timeout-ms 20000` sans limite de messages attend 20 secondes d'inactivité avant de lever une exception pour terminer le processus.
 * **Correction :** Ajout de l'option `--max-messages 1` pour forcer une sortie propre (code 0) dès la réception du premier message validé.
@@ -225,8 +225,8 @@ Lors des tests sur cluster local (Docker Desktop / Kubernetes), 6 blocages majeu
 * **Correction :** Suppression du conteneur orphelin (`docker rm -f kind-registry-mirror`), automatiquement recréé avec l'image `v0.0.4` disposant d'un healthcheck conforme.
 
 ### 5.6. Idempotence et persistance des topics (`poc-kafka-admin` orphelin)
-* **Symptôme :** Lors d'une ré-exécution du script sans suppression préalable du namespace, les pods de test échouaient avec :  
-  `UnknownTopicOrPartitionException: This server does not host this topic-partition`  
+* **Symptôme :** Lors d'une ré-exécution du script sans suppression préalable du namespace, les pods de test échouaient avec :
+  `UnknownTopicOrPartitionException: This server does not host this topic-partition`
   `TimeoutException: Topic poc-user-operator-topic not present in metadata after 60000 ms`.
 * **Cause :** Dans la configuration PoC par défaut, le broker Kafka utilise un stockage temporaire (`emptyDir`). Lors d'un redémarrage ou d'une recréation du broker `kafka-0`, les topics précédents disparaissent. Or, la fonction `create_topic_as_uo_superuser` exécutait `kubectl apply` sur le pod `poc-kafka-admin` sans le supprimer au préalable. Comme un pod Kubernetes est immuable et qu'il était déjà à l'état `Completed`, Kubernetes ne le ré-exécutait pas et `kubectl wait` passait immédiatement sans recréer le topic.
 * **Correction :** Ajout de `kubectl delete pod -n "$NAMESPACE" poc-kafka-admin --ignore-not-found` avant son déploiement pour forcer sa ré-exécution à chaque lancement du script.
@@ -243,18 +243,18 @@ L'usage d'**OpenSSL** dans ce projet constitue la passerelle d'interopérabilit�
 flowchart TD
     subgraph CERT_MANAGER["cert-manager (PKI Kubernetes)"]
         CA["Kafka Root CA (Issuer: kafka-ca)"]
-        CERT["Secret standard : kubernetes.io/tls\n- tls.crt (Certificat public PEM)\n- tls.key (Clé privée RSA PKCS#1)"]
+        CERT["Secret standard : kubernetes.io/tls<br>- tls.crt (Certificat public PEM)<br>- tls.key (Clé privée RSA PKCS#1)"]
         CA --> CERT
     end
 
     subgraph OPENSSL["Opérations OpenSSL (Passerelle)"]
-        OP1["1. openssl pkcs12 -export\nAssemblage Cert + Clé + CA\navec Alias & Mot de passe"]
-        OP2["2. openssl pkcs8 -topk8 -nocrypt\nConversion de structure ASN.1 :\nPKCS#1 -> PKCS#8"]
+        OP1["1. openssl pkcs12 -export<br>Assemblage Cert + Clé + CA<br>avec Alias & Mot de passe"]
+        OP2["2. openssl pkcs8 -topk8 -nocrypt<br>Conversion de structure ASN.1 :<br>PKCS#1 -> PKCS#8"]
     end
 
     subgraph DEST["Consommateurs (Kafka & Strimzi)"]
-        KAFKA["Broker Kafka & Clients CLI\n(broker.p12, user.p12)"]
-        UO["Strimzi User Operator 1.2.0\n(entity-operator.key PKCS#8)"]
+        KAFKA["Broker Kafka & Clients CLI<br>(broker.p12, user.p12)"]
+        UO["Strimzi User Operator 1.2.0<br>(entity-operator.key PKCS#8)"]
     end
 
     CERT -- "tls.crt + tls.key + ca.crt" --> OP1 --> KAFKA
@@ -263,11 +263,11 @@ flowchart TD
 
 ### 1. `openssl pkcs12 -export` : Conversion PEM vers Keystores Java PKCS#12
 
-* **Limitation de cert-manager :**  
+* **Limitation de cert-manager :**
   cert-manager génère des Secrets Kubernetes contenant des fichiers texte PEM plats (`tls.crt` et `tls.key`). Il ne produit pas de conteneur d'archive PKCS#12 unifié.
-* **Besoin de Kafka :**  
+* **Besoin de Kafka :**
   Le broker Apache Kafka et ses clients Java attendent un Keystore sécurisé par mot de passe contenant simultanément la clé privée, le certificat signé et la chaîne de certification sous un alias explicite (`kafka-broker`, `strimzi-user-operator`, etc.).
-* **Rôle d'OpenSSL :**  
+* **Rôle d'OpenSSL :**
   La commande suivante fusionne ces éléments dans un fichier binaire `.p12` :
   ```bash
   openssl pkcs12 -export \
@@ -281,23 +281,23 @@ flowchart TD
 
 ### 2. `openssl pkcs8 -topk8 -nocrypt` : Incompatibilité ASN.1 (PKCS#1 vs PKCS#8)
 
-* **Spécificité de cert-manager :**  
+* **Spécificité de cert-manager :**
   cert-manager émet par défaut les clés RSA sous la norme historique **PKCS#1** :
   ```text
   -----BEGIN RSA PRIVATE KEY-----
   MIIEowIBAAKCAQ...
   -----END RSA PRIVATE KEY-----
   ```
-* **Exigence de Strimzi User Operator 1.2.0 :**  
+* **Exigence de Strimzi User Operator 1.2.0 :**
   Strimzi 1.2.0 charge les certificats via sa classe `PemAuthIdentity`, qui décode la clé privée au moyen de la classe Java standard `PKCS8EncodedKeySpec`. La JVM attend rigoureusement le standard universel **PKCS#8** (`AlgorithmIdentifier` inclus) :
   ```text
   -----BEGIN PRIVATE KEY-----
   MIIEvQIBADANBgk...
   -----END PRIVATE KEY-----
   ```
-  L'injection directe d'une clé PKCS#1 générée par cert-manager provoque un crash immédiat de la JVM :  
+  L'injection directe d'une clé PKCS#1 générée par cert-manager provoque un crash immédiat de la JVM :
   `java.security.InvalidKeyException: Unable to decode key: java.io.IOException: algid parse error, not a sequence`.
-* **Rôle d'OpenSSL :**  
+* **Rôle d'OpenSSL :**
   OpenSSL réécrit l'enveloppe ASN.1 sans modifier les composantes cryptographiques de la clé :
   ```bash
   openssl pkcs8 -topk8 -nocrypt -in "$d/uo.key" -out "$d/entity-operator.key"
@@ -305,7 +305,7 @@ flowchart TD
 
 ### 3. Pourquoi `keytool` pour le Truststore (et non OpenSSL) ?
 
-Pour le magasin d'ancres de confiance (`truststore.p12`), la commande `openssl pkcs12 -export -nokeys` génère un *Certificate Bag* standard qui n'est pas reconnu par le provider JSSE de Java comme une collection de `TrustedCertificateEntry`. Cela provoquait à l'exécution :  
+Pour le magasin d'ancres de confiance (`truststore.p12`), la commande `openssl pkcs12 -export -nokeys` génère un *Certificate Bag* standard qui n'est pas reconnu par le provider JSSE de Java comme une collection de `TrustedCertificateEntry`. Cela provoquait à l'exécution :
 `InvalidAlgorithmParameterException: the trustAnchors parameter must be non-empty`.
 
 Le script utilise donc `keytool -importcert -storetype PKCS12` pour garantir une compatibilité native et irréprochable avec le runtime Java.
