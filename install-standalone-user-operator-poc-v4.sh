@@ -399,6 +399,11 @@ create_uo_admin_secret() {
 
   extract_secret_files "${UO_CERT_SECRET}-certmanager" "$d/uo"
 
+  # Strimzi 1.2.0 uses PemAuthIdentity which expects PKCS#8 private key and PEM certificate:
+  # entity-operator.key and entity-operator.crt
+  openssl pkcs8 -topk8 -nocrypt -in "$d/uo.key" -out "$d/entity-operator.key"
+  cp "$d/uo.crt" "$d/entity-operator.crt"
+
   make_pkcs12 \
     "$d/uo.crt" \
     "$d/uo.key" \
@@ -406,10 +411,6 @@ create_uo_admin_secret() {
     "$d/entity-operator.p12" \
     strimzi-user-operator
 
-  # Strimzi's standalone UO specifically expects:
-  #   entity-operator.p12
-  #   entity-operator.password
-  # in STRIMZI_EO_KEY_SECRET_NAME.
   printf '%s' "$PASSWORD" > "$d/entity-operator.password"
 
   make_truststore "$d/uo.ca.crt" "$d/truststore.p12"
@@ -418,6 +419,8 @@ create_uo_admin_secret() {
     --ignore-not-found >/dev/null
 
   kubectl -n "$NAMESPACE" create secret generic "$UO_CERT_SECRET" \
+    --from-file=entity-operator.key="$d/entity-operator.key" \
+    --from-file=entity-operator.crt="$d/entity-operator.crt" \
     --from-file=entity-operator.p12="$d/entity-operator.p12" \
     --from-file=entity-operator.password="$d/entity-operator.password" \
     --from-file=truststore.p12="$d/truststore.p12"
@@ -453,6 +456,11 @@ create_external_user_client_secret() {
 
 patch_kafka_readiness_probe() {
   log "Replacing HelmForge plaintext readiness probe with a TLS+mTLS Kafka API probe"
+
+  # The Kafka client listener advertises the Service DNS (kafka.kafka-security.svc.cluster.local:9092).
+  # Allow traffic to unready pods so the readiness probe can connect via the advertised listener.
+  kubectl -n "$NAMESPACE" patch svc "$KAFKA_SERVICE" \
+    -p '{"spec":{"publishNotReadyAddresses":true}}'
 
   local container_name
   container_name="$(
@@ -502,6 +510,9 @@ YAML
   kubectl -n "$NAMESPACE" patch statefulset "$KAFKA_FULLNAME" \
     --type=strategic \
     --patch-file "${TMP_ROOT}/kafka-readiness-patch.yaml"
+
+  # Delete initial unready pod to trigger immediate recreation with the new probe
+  kubectl -n "$NAMESPACE" delete pod "$KAFKA_POD" --ignore-not-found >/dev/null 2>&1 || true
 
   log "Waiting for Kafka StatefulSet rollout after readiness probe patch"
   kubectl -n "$NAMESPACE" rollout status \
@@ -785,6 +796,7 @@ spec:
             --group ${KAFKA_GROUP} \
             --from-beginning \
             --consumer.config /tmp/client.properties \
+            --max-messages 1 \
             --timeout-ms 20000 |
             grep -F "\${MESSAGE}"
       volumeMounts:
