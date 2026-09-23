@@ -183,9 +183,9 @@ Le script [`install-standalone-user-operator-poc-v4.sh`](./install-standalone-us
 
 ## 5. Problèmes Résolus et Décisions d'Ingénierie
 
-Lors des tests sur cluster local (Docker Desktop / Kubernetes), 5 blocages majeurs ont été diagnostiqués et corrigés dans le script :
+Lors des tests sur cluster local (Docker Desktop / Kubernetes), 6 blocages majeurs ont été diagnostiqués et corrigés dans le script :
 
-### 1. Deadlock du Readiness Probe Kafka (`SSL handshake failed`)
+### 5.1. Deadlock du Readiness Probe Kafka (`SSL handshake failed`)
 * **Symptôme :** Le broker loggait toutes les 10s :  
   `Failed authentication with /127.0.0.1 (SSL handshake failed)` et le pod restait `0/1 Running`.
 * **Causes :**
@@ -197,7 +197,7 @@ Lors des tests sur cluster local (Docker Desktop / Kubernetes), 5 blocages majeu
   - Patch du StatefulSet avec la configuration mTLS complète pour le probe.
   - Suppression automatique du pod `kafka-0` après le patch pour déclencher sa recréation immédiate sous la nouvelle révision.
 
-### 2. Format des Clés et Certificats pour Strimzi UO 1.2.0 (`PemAuthIdentity`)
+### 5.2. Format des Clés et Certificats pour Strimzi UO 1.2.0 (`PemAuthIdentity`)
 * **Symptôme :** Crash en boucle de l'opérateur :  
   `RuntimeException: The Secret ... is missing the field entity-operator.key`  
   Puis après ajout de la clé :  
@@ -209,22 +209,22 @@ Lors des tests sur cluster local (Docker Desktop / Kubernetes), 5 blocages majeu
   - Conversion de la clé via `openssl pkcs8 -topk8 -nocrypt`.
   - Injection conjointe des formats PEM PKCS#8 (`entity-operator.key`, `entity-operator.crt`) et PKCS#12 dans le Secret `strimzi-user-operator-certs`.
 
-### 3. Sortie propre du Consumer de test
+### 5.3. Sortie propre du Consumer de test
 * **Symptôme :** Log trompeur en fin de test :  
   `ERROR Error processing message, terminating consumer process: org.apache.kafka.common.errors.TimeoutException`.
 * **Cause :** `kafka-console-consumer.sh` avec `--timeout-ms 20000` sans limite de messages attend 20 secondes d'inactivité avant de lever une exception pour terminer le processus.
 * **Correction :** Ajout de l'option `--max-messages 1` pour forcer une sortie propre (code 0) dès la réception du premier message validé.
 
-### 4. Isolation de la mise à jour des dépôts Helm
+### 5.4. Isolation de la mise à jour des dépôts Helm
 * **Symptôme :** Échec immédiat de `install_kafka` sur `helm repo update` en cas de dépôt tiers invalide sur le poste hôte (ex: bucket GCS avec token OAuth expiré).
 * **Correction :** Remplacement de `helm repo update` par `helm repo update helmforge >/dev/null`.
 
-### 5. Conteneur résiduel Docker Desktop (`kind-registry-mirror`)
+### 5.5. Conteneur résiduel Docker Desktop (`kind-registry-mirror`)
 * **Symptôme :** Docker Desktop n'arrivait pas à démarrer ou voir le cluster Kubernetes local (`kubernetes failed to start`).
 * **Cause :** Un ancien conteneur `kind-registry-mirror` datant d'une version précédente n'avait pas de healthcheck configuré. Docker Desktop 4.92+ exécute `docker inspect -f '{{.State.Health.Status}}'` qui renvoyait une erreur et bloquait le cluster.
 * **Correction :** Suppression du conteneur orphelin (`docker rm -f kind-registry-mirror`), automatiquement recréé avec l'image `v0.0.4` disposant d'un healthcheck conforme.
 
-### 6. Idempotence et persistance des topics (`poc-kafka-admin` orphelin)
+### 5.6. Idempotence et persistance des topics (`poc-kafka-admin` orphelin)
 * **Symptôme :** Lors d'une ré-exécution du script sans suppression préalable du namespace, les pods de test échouaient avec :  
   `UnknownTopicOrPartitionException: This server does not host this topic-partition`  
   `TimeoutException: Topic poc-user-operator-topic not present in metadata after 60000 ms`.
