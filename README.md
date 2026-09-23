@@ -25,6 +25,7 @@ flowchart TD
             CA --> CERT_BROKER["Cert Broker (kafka-broker-tls)"]
             CA --> CERT_UO["Cert User Operator (strimzi-user-operator-certs)"]
             CA --> CERT_USER["Cert Client Externe (catalog-product-updated...)"]
+            CA --> CERT_UNAUTH["Cert Client Non Autorisé (unauthorized.cart...)"]
         end
 
         subgraph KAFKA_CLUSTER["Cluster Apache Kafka 4.3.1 (KRaft)"]
@@ -39,12 +40,14 @@ flowchart TD
 
         subgraph CLIENTS["Validation Pods"]
             ADMIN_POD["Pod : poc-kafka-admin\n(Création Topic via Superuser)"]
-            CLIENT_POD["Pod : poc-authorized-client\n(Producer & Consumer mTLS)"]
+            UNAUTH_POD["Pod : poc-unauthorized-client\n(Test Négatif : Rejet ACL)"]
+            CLIENT_POD["Pod : poc-authorized-client\n(Test Positif : Pub/Sub mTLS)"]
         end
 
         UO -- "Gère les ACLs (Admin API TLS)" --> SVC
         ADMIN_POD -- "Superuser Admin API" --> SVC
-        CLIENT_POD -- "Pub/Sub mTLS vérifié par ACLs" --> SVC
+        UNAUTH_POD -- "Rejeté par ACLs (TopicAuthorizationException)" --> SVC
+        CLIENT_POD -- "Pub/Sub mTLS autorisé par ACLs" --> SVC
         UO -- "Watch & Status" --> KU["CRD KafkaUser\n(catalog-product-updated...)"]
     end
 ```
@@ -80,10 +83,11 @@ Le script [`install-standalone-user-operator-poc-v4.sh`](./install-standalone-us
 - Crée un Issuer auto-signé `poc-selfsigned`.
 - Génère un certificat CA racine `kafka-root-ca` (durée 1 an, RSA 3072 bits).
 - Configure un Issuer Kubernetes `kafka-ca` basé sur cette autorité racine.
-- Émet 3 certificats signés par cette CA :
+- Émet 4 certificats signés par cette CA :
   1. `kafka-broker` : avec SANs DNS complets (`kafka`, `kafka-0`, services headless et FQDNs).
   2. `strimzi-user-operator` : certificat d'identité du client Admin de l'opérateur.
-  3. `catalog-product-updated.cart.xxxxxx.io` : certificat du client applicatif final.
+  3. `catalog-product-updated.cart.xxxxxx.io` : certificat du client applicatif autorisé.
+  4. `unauthorized.cart.xxxxxx.io` : certificat client valide mais volontairement dépourvu de permissions ACL.
 
 ### Étape 4 : Préparation des Secrets TLS (PKCS#12, PKCS#8 et PEM)
 - **Secret Broker (`kafka-broker-tls-pkcs12`)** :
@@ -95,8 +99,8 @@ Le script [`install-standalone-user-operator-poc-v4.sh`](./install-standalone-us
   - Convertit la clé privée en **PKCS#8** (`entity-operator.key`).
   - Extrait le certificat PEM (`entity-operator.crt`).
   - Génère le PKCS#12 (`entity-operator.p12`) et le Truststore pour le pod de test admin.
-- **Secret Client Applicatif (`<user>-tls-client`)** :
-  - Keystore PKCS#12 contenant la clé et le certificat du client final pour le test de publication/consommation.
+- **Secrets Clients Applicatifs (`<user>-tls-client`)** :
+  - Keystores PKCS#12 contenant la clé et le certificat pour le client autorisé et pour le client non autorisé.
 
 ### Étape 5 : Déploiement d'Apache Kafka avec HelmForge
 - Configure le chart `helmforge/kafka` en mode `single-broker` (KRaft).
@@ -162,8 +166,15 @@ Le script [`install-standalone-user-operator-poc-v4.sh`](./install-standalone-us
 - Attend que le User Operator réconcilie l'utilisateur (`status.conditions[?(@.type=="Ready")].status == "True"`).
 - Vérifie qu'aucun secret de clé n'a été créé par Strimzi (comportement attendu de `tls-external`).
 
-### Étape 10 : Test End-to-End Producer & Consumer
-- Déploie le pod `poc-authorized-client` avec le certificat du client final.
+### Étape 10 : Test Négatif (Vérification du rejet d'un client non autorisé)
+- Déploie le pod `poc-unauthorized-client` avec le certificat de `unauthorized.cart.xxxxxx.io` (client mTLS valide mais sans `KafkaUser` ni ACLs associées).
+- Vérifie que la tentative de publication via `kafka-console-producer.sh` est **bloquée** avec l'exception :
+  `org.apache.kafka.common.errors.TopicAuthorizationException: Not authorized to access topics: [poc-user-operator-topic]`.
+- Vérifie que la tentative de consommation via `kafka-console-consumer.sh` est également **bloquée** avec `TopicAuthorizationException`.
+- Le pod ne réussit (`Succeeded`) que si les deux opérations sont strictement rejetées par le `StandardAuthorizer` de Kafka.
+
+### Étape 11 : Test Positif End-to-End (Validation du flux autorisé)
+- Déploie le pod `poc-authorized-client` avec le certificat du client autorisé `catalog-product-updated.cart.xxxxxx.io`.
 - Publie un message `authorized-catalog-product-updated.cart.xxxxxx.io` via `kafka-console-producer.sh`.
 - Consomme le message via `kafka-console-consumer.sh` avec `--max-messages 1`.
 - Valide la correspondance exacte du message et affiche l'état global des ressources.
@@ -212,6 +223,13 @@ Lors des tests sur cluster local (Docker Desktop / Kubernetes), 5 blocages majeu
 * **Symptôme :** Docker Desktop n'arrivait pas à démarrer ou voir le cluster Kubernetes local (`kubernetes failed to start`).
 * **Cause :** Un ancien conteneur `kind-registry-mirror` datant d'une version précédente n'avait pas de healthcheck configuré. Docker Desktop 4.92+ exécute `docker inspect -f '{{.State.Health.Status}}'` qui renvoyait une erreur et bloquait le cluster.
 * **Correction :** Suppression du conteneur orphelin (`docker rm -f kind-registry-mirror`), automatiquement recréé avec l'image `v0.0.4` disposant d'un healthcheck conforme.
+
+### 6. Idempotence et persistance des topics (`poc-kafka-admin` orphelin)
+* **Symptôme :** Lors d'une ré-exécution du script sans suppression préalable du namespace, les pods de test échouaient avec :  
+  `UnknownTopicOrPartitionException: This server does not host this topic-partition`  
+  `TimeoutException: Topic poc-user-operator-topic not present in metadata after 60000 ms`.
+* **Cause :** Dans la configuration PoC par défaut, le broker Kafka utilise un stockage temporaire (`emptyDir`). Lors d'un redémarrage ou d'une recréation du broker `kafka-0`, les topics précédents disparaissent. Or, la fonction `create_topic_as_uo_superuser` exécutait `kubectl apply` sur le pod `poc-kafka-admin` sans le supprimer au préalable. Comme un pod Kubernetes est immuable et qu'il était déjà à l'état `Completed`, Kubernetes ne le ré-exécutait pas et `kubectl wait` passait immédiatement sans recréer le topic.
+* **Correction :** Ajout de `kubectl delete pod -n "$NAMESPACE" poc-kafka-admin --ignore-not-found` avant son déploiement pour forcer sa ré-exécution à chaque lancement du script.
 
 ---
 
@@ -352,6 +370,16 @@ kubectl -n kafka-security logs deployment/strimzi-user-operator -f
 Consulter les logs du broker Kafka :
 ```bash
 kubectl -n kafka-security logs kafka-0 -c kafka -f
+```
+
+Consulter les logs du test négatif (rejet de l'utilisateur non autorisé) :
+```bash
+kubectl -n kafka-security logs pod/poc-unauthorized-client
+```
+
+Consulter les logs du test positif (succès de l'utilisateur autorisé) :
+```bash
+kubectl -n kafka-security logs pod/poc-authorized-client
 ```
 
 Vérifier la validité des certificats cert-manager :

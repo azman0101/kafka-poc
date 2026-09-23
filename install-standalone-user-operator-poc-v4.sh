@@ -68,6 +68,10 @@ CLUSTER_CA_CERT_SECRET="${CLUSTER_CA_CERT_SECRET:-kafka-cluster-ca-cert}"
 USER_CERTIFICATE="${USER_CERTIFICATE:-${KAFKA_USER}}"
 USER_CERT_SECRET="${USER_CERT_SECRET:-${KAFKA_USER}-tls}"
 
+UNAUTHORIZED_USER="${UNAUTHORIZED_USER:-unauthorized.cart.xxxxxx.io}"
+UNAUTHORIZED_CERTIFICATE="${UNAUTHORIZED_CERTIFICATE:-${UNAUTHORIZED_USER}}"
+UNAUTHORIZED_CERT_SECRET="${UNAUTHORIZED_CERT_SECRET:-${UNAUTHORIZED_USER}-tls}"
+
 PASSWORD="${POC_KEYSTORE_PASSWORD:-poc-changeit}"
 # kubectl uses the current context or the KUBECONFIG environment variable.
 TMP_ROOT="${TMP_ROOT:-$(mktemp -d)}"
@@ -260,6 +264,33 @@ YAML
   wait_cert "$USER_CERTIFICATE"
 }
 
+create_unauthorized_user_certificate() {
+  log "Creating unauthorized Kafka client certificate (without KafkaUser/ACLs)"
+
+  kubectl apply -f - <<YAML
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ${UNAUTHORIZED_CERTIFICATE}
+  namespace: ${NAMESPACE}
+spec:
+  secretName: ${UNAUTHORIZED_CERT_SECRET}
+  commonName: ${UNAUTHORIZED_USER}
+  duration: 8760h
+  renewBefore: 720h
+  usages:
+    - client auth
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  issuerRef:
+    name: ${KAFKA_CA_ISSUER}
+    kind: Issuer
+YAML
+
+  wait_cert "$UNAUTHORIZED_CERTIFICATE"
+}
+
 make_pkcs12() {
   local crt="$1"
   local key="$2"
@@ -449,6 +480,34 @@ create_external_user_client_secret() {
     --ignore-not-found >/dev/null
 
   kubectl -n "$NAMESPACE" create secret generic "${USER_CERT_SECRET}-client" \
+    --from-file=user.p12="$d/user.p12" \
+    --from-file=truststore.p12="$d/truststore.p12" \
+    --from-file=password="$d/password"
+}
+
+create_unauthorized_user_client_secret() {
+  log "Creating client material for ${UNAUTHORIZED_USER}"
+
+  local d="${TMP_ROOT}/unauthorized_user"
+  mkdir -p "$d"
+
+  extract_secret_files "$UNAUTHORIZED_CERT_SECRET" "$d/user"
+
+  make_pkcs12 \
+    "$d/user.crt" \
+    "$d/user.key" \
+    "$d/user.ca.crt" \
+    "$d/user.p12" \
+    "$UNAUTHORIZED_USER"
+
+  make_truststore "$d/user.ca.crt" "$d/truststore.p12"
+
+  printf '%s' "$PASSWORD" > "$d/password"
+
+  kubectl -n "$NAMESPACE" delete secret "${UNAUTHORIZED_CERT_SECRET}-client" \
+    --ignore-not-found >/dev/null
+
+  kubectl -n "$NAMESPACE" create secret generic "${UNAUTHORIZED_CERT_SECRET}-client" \
     --from-file=user.p12="$d/user.p12" \
     --from-file=truststore.p12="$d/truststore.p12" \
     --from-file=password="$d/password"
@@ -650,6 +709,9 @@ install_user_operator() {
 create_topic_as_uo_superuser() {
   log "Creating ${KAFKA_TOPIC} through Kafka Admin API"
 
+  kubectl delete pod -n "$NAMESPACE" poc-kafka-admin \
+    --ignore-not-found >/dev/null 2>&1 || true
+
   cat <<YAML | kubectl apply -n "$NAMESPACE" -f -
 apiVersion: v1
 kind: Pod
@@ -815,6 +877,89 @@ YAML
     --timeout=5m
 }
 
+test_unauthorized_user() {
+  log "Testing that unmapped mTLS user without ACLs is strictly rejected"
+
+  kubectl -n "$NAMESPACE" delete pod poc-unauthorized-client --ignore-not-found >/dev/null 2>&1 || true
+
+  cat <<YAML | kubectl apply -n "$NAMESPACE" -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: poc-unauthorized-client
+spec:
+  restartPolicy: Never
+  containers:
+    - name: kafka-client
+      image: docker.io/apache/kafka:${KAFKA_IMAGE_TAG}
+      command:
+        - /bin/bash
+        - -ec
+        - |
+          PASSWORD="\$(cat /tls/password)"
+
+          cat >/tmp/client.properties <<EOF
+          security.protocol=SSL
+          ssl.keystore.type=PKCS12
+          ssl.keystore.location=/tls/user.p12
+          ssl.keystore.password=\${PASSWORD}
+          ssl.truststore.type=PKCS12
+          ssl.truststore.location=/tls/truststore.p12
+          ssl.truststore.password=\${PASSWORD}
+          ssl.endpoint.identification.algorithm=HTTPS
+          EOF
+
+          echo "Attempting unauthorized produce (expecting rejection)..."
+          PRODUCE_ERR="\$(echo "unauthorized-payload" | /opt/kafka/bin/kafka-console-producer.sh \
+            --bootstrap-server ${KAFKA_SERVICE}.${NAMESPACE}.svc.cluster.local:${KAFKA_CLIENT_PORT} \
+            --topic ${KAFKA_TOPIC} \
+            --producer.config /tmp/client.properties \
+            --request-timeout-ms 5000 \
+            --max-block-ms 5000 2>&1 || true)"
+
+          echo "\${PRODUCE_ERR}"
+          if echo "\${PRODUCE_ERR}" | grep -E "TopicAuthorizationException|TOPIC_AUTHORIZATION_FAILED" >/dev/null; then
+            echo "Producer correctly rejected by Kafka authorization"
+          else
+            echo "ERROR: Producer was unexpectedly NOT rejected!"
+            exit 1
+          fi
+
+          echo "Attempting unauthorized consume (expecting rejection)..."
+          CONSUME_ERR="\$(/opt/kafka/bin/kafka-console-consumer.sh \
+            --bootstrap-server ${KAFKA_SERVICE}.${NAMESPACE}.svc.cluster.local:${KAFKA_CLIENT_PORT} \
+            --topic ${KAFKA_TOPIC} \
+            --group ${KAFKA_GROUP} \
+            --from-beginning \
+            --consumer.config /tmp/client.properties \
+            --max-messages 1 \
+            --timeout-ms 5000 2>&1 || true)"
+
+          echo "\${CONSUME_ERR}"
+          if echo "\${CONSUME_ERR}" | grep -E "TopicAuthorizationException|TOPIC_AUTHORIZATION_FAILED" >/dev/null; then
+            echo "Consumer correctly rejected by Kafka authorization"
+          else
+            echo "ERROR: Consumer was unexpectedly NOT rejected!"
+            exit 1
+          fi
+
+          echo "SUCCESS: Unauthorized access was blocked on both produce and consume"
+      volumeMounts:
+        - name: client
+          mountPath: /tls
+          readOnly: true
+  volumes:
+    - name: client
+      secret:
+        secretName: ${UNAUTHORIZED_CERT_SECRET}-client
+YAML
+
+  kubectl -n "$NAMESPACE" wait \
+    --for=jsonpath='{.status.phase}'=Succeeded \
+    pod/poc-unauthorized-client \
+    --timeout=2m
+}
+
 show_state() {
   echo
   log "Kafka"
@@ -855,11 +1000,13 @@ main() {
   create_broker_certificate
   create_uo_certificate
   create_external_user_certificate
+  create_unauthorized_user_certificate
 
   create_broker_pkcs12_secret
   create_strimzi_ca_secrets
   create_uo_admin_secret
   create_external_user_client_secret
+  create_unauthorized_user_client_secret
 
   install_kafka
   install_user_operator
@@ -868,6 +1015,7 @@ main() {
 
   create_kafka_user
   verify_external_tls_user
+  test_unauthorized_user
   test_authorized_user
 
   show_state
